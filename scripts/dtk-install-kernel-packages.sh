@@ -1,44 +1,72 @@
 #!/bin/bash
 #
 # Installs the kernel-devel/headers/modules/rt/64k packages that must match
-# the RHCOS kernel exactly, by pulling and mounting a rhel-coreos-extensions /
-# rhel-coreos-10-extensions image at runtime (via nested podman) rather than
-# baking them into this image at build time.
+# the RHCOS kernel exactly, sourced from a rhel-coreos-extensions /
+# rhel-coreos-10-extensions image, rather than baking them into this image
+# at build time.
+#
+# Two ways to provide that image's content:
+#
+#  1. (preferred, no elevated privileges needed) Mount it yourself at
+#     DTK_EXTENSIONS_MOUNT (default /mnt/rhcos-extensions) before running
+#     this script - e.g. a Kubernetes/OpenShift `image` volume:
+#
+#       volumes:
+#       - name: rhcos-extensions
+#         image:
+#           reference: <rhel-coreos-extensions-pullspec>
+#           pullPolicy: IfNotPresent
+#       containers:
+#       - volumeMounts:
+#         - name: rhcos-extensions
+#           mountPath: /mnt/rhcos-extensions
+#
+#     If the extensions image's content is already present at that path,
+#     it's used directly and no podman/privilege is needed at all.
+#
+#  2. (fallback, needs elevated privileges) Pass the extensions image
+#     pullspec as $1. This script pulls and mounts it itself via nested
+#     podman, which requires running with enough privilege for podman to
+#     create its own mount namespaces (e.g. --privileged).
 #
 # Usage:
-#   dtk-install-kernel-packages.sh <extensions-image-pullspec>
-#
-# Requires network access and registry credentials for <extensions-image-pullspec>
-# to be available to podman inside this container (e.g. a mounted pull secret).
+#   dtk-install-kernel-packages.sh [extensions-image-pullspec]
 set -euo pipefail
 
-EXTENSIONS_IMAGE=${1:?"usage: $(basename "$0") <extensions-image-pullspec>"}
-STORAGE_DRIVER=${DTK_PODMAN_STORAGE_DRIVER:-vfs}
+DTK_EXTENSIONS_MOUNT=${DTK_EXTENSIONS_MOUNT:-/mnt/rhcos-extensions}
+RPM_OSTREE_DIR="${DTK_EXTENSIONS_MOUNT}/usr/share/rpm-ostree"
 
-podman_() {
-    podman --storage-driver "${STORAGE_DRIVER}" "$@"
-}
+if [ -f "${RPM_OSTREE_DIR}/extensions.json" ]; then
+    echo "INFO: found extensions content already mounted at ${DTK_EXTENSIONS_MOUNT}, skipping podman"
+else
+    EXTENSIONS_IMAGE=${1:?"usage: $(basename "$0") [extensions-image-pullspec] (required when extensions content isn't already mounted at ${DTK_EXTENSIONS_MOUNT})"}
+    STORAGE_DRIVER=${DTK_PODMAN_STORAGE_DRIVER:-vfs}
 
-echo "INFO: pulling ${EXTENSIONS_IMAGE}"
-podman_ pull "${EXTENSIONS_IMAGE}"
+    podman_() {
+        podman --storage-driver "${STORAGE_DRIVER}" "$@"
+    }
 
-cid=$(podman_ create "${EXTENSIONS_IMAGE}")
-cleanup() {
-    podman_ unmount "${cid}" >/dev/null 2>&1 || true
-    podman_ rm "${cid}" >/dev/null 2>&1 || true
-    rm -f "${REPO_FILE:-}"
-}
-trap cleanup EXIT
+    echo "INFO: pulling ${EXTENSIONS_IMAGE}"
+    podman_ pull "${EXTENSIONS_IMAGE}"
 
-echo "INFO: mounting ${EXTENSIONS_IMAGE}"
-mnt=$(podman_ mount "${cid}")
+    cid=$(podman_ create "${EXTENSIONS_IMAGE}")
+    cleanup() {
+        podman_ unmount "${cid}" >/dev/null 2>&1 || true
+        podman_ rm "${cid}" >/dev/null 2>&1 || true
+        rm -f "${REPO_FILE:-}"
+    }
+    trap cleanup EXIT
 
-RPM_OSTREE_DIR="${mnt}/usr/share/rpm-ostree"
+    echo "INFO: mounting ${EXTENSIONS_IMAGE}"
+    mnt=$(podman_ mount "${cid}")
+    RPM_OSTREE_DIR="${mnt}/usr/share/rpm-ostree"
+fi
+
 EXTENSIONS_REPO_DIR="${RPM_OSTREE_DIR}/extensions"
 EXTENSIONS_JSON="${RPM_OSTREE_DIR}/extensions.json"
 
-[ -d "${EXTENSIONS_REPO_DIR}" ] || { echo "ERROR: ${EXTENSIONS_REPO_DIR} not found in ${EXTENSIONS_IMAGE}" >&2; exit 1; }
-[ -f "${EXTENSIONS_JSON}" ] || { echo "ERROR: ${EXTENSIONS_JSON} not found in ${EXTENSIONS_IMAGE}" >&2; exit 1; }
+[ -d "${EXTENSIONS_REPO_DIR}" ] || { echo "ERROR: ${EXTENSIONS_REPO_DIR} not found" >&2; exit 1; }
+[ -f "${EXTENSIONS_JSON}" ] || { echo "ERROR: ${EXTENSIONS_JSON} not found" >&2; exit 1; }
 
 REPO_FILE=/etc/yum.repos.d/rhcos-extensions.repo
 printf '[rhcos-extensions]\nname=RHCOS Extensions\nbaseurl=file://%s\nenabled=1\ngpgcheck=0\n' "${EXTENSIONS_REPO_DIR}" > "${REPO_FILE}"

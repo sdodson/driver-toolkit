@@ -1,0 +1,158 @@
+#
+# POC: source the kernel RPMs that must exactly match the RHCOS kernel from
+# the rhel-coreos-extensions payload image instead of pinning them via
+# ART-supplied KERNEL_VERSION/RT_KERNEL_VERSION build-args against a RHEL repo
+# mirror. The extensions image ships a real dnf repo (RPMs + repodata) at
+# /usr/share/rpm-ostree/extensions/, composed from the exact same rootfs as
+# the node's kernel (openshift/os extensions/*.yaml, `match-base-evr: kernel`),
+# and an /usr/share/rpm-ostree/extensions/extensions.json index that lists the
+# exact NVR of every package in each named extension group - so the version to
+# install can be read directly from the image instead of being plumbed in by
+# ART for every release.
+#
+# Validated against a real 4.18 rhel-coreos-extensions image (see below):
+#   - kernel-devel, kernel-headers install standalone straight from the
+#     extensions repo.
+#   - kernel-rt-devel, kernel-rt-modules, kernel-rt-modules-extra also install
+#     standalone from the extensions repo (it happens to include
+#     kernel-rt-modules-core, so the rt set is self-contained).
+#   - kernel-modules / kernel-modules-extra are NOT self-contained: they
+#     require kernel-modules-core, which the plain (non-rt) "kernel" extension
+#     group does not currently ship. This needs to be added in openshift/os
+#     (mirroring what the "kernel-rt" group already does) before this fully
+#     replaces the dnf-from-RHEL-repo path for those two packages. Until then
+#     dnf will fall back to the normal RHEL repos for kernel-modules-core,
+#     same as it must today.
+#   - kernel-devel-matched and kernel-rpm-macros are not published in any
+#     extension group at all; same fallback applies.
+#   - Generic build tooling (gcc, gcc-c++, elfutils-libelf-devel, autoconf,
+#     git, etc.) is intentionally NOT sourced from the extensions image: it's
+#     not RHCOS-kernel-version-locked, and several of the extensions copies
+#     (e.g. gcc) carry their own strict "=" version deps (libgomp) that are
+#     not themselves published as extensions - the ordinary RHEL repos remain
+#     the right source for these, exactly as today.
+#
+# Build args:
+#   BASE_IMAGE       - non-kernel package source (RHEL build root). Defaults
+#                       to the real ART base image; override for local
+#                       testing (e.g. quay.io/centos/centos:stream9 - a public
+#                       RHEL9 base image lacks kernel content entirely).
+#   EXTENSIONS_IMAGE - pullspec/digest of the rhel-coreos-extensions image for
+#                       the target release, e.g. the output of
+#                       `oc adm release info --image-for=rhel-coreos-extensions`.
+#                       In production ART would supply this the same way it
+#                       already supplies other payload-internal FROM refs.
+#   RHEL_VERSION     - as in the existing Dockerfile.
+#
+ARG BASE_IMAGE=registry.ci.openshift.org/ocp/5.0:base-rhel9
+ARG EXTENSIONS_IMAGE
+
+FROM ${EXTENSIONS_IMAGE} AS extensions
+
+FROM ${BASE_IMAGE}
+ARG RHEL_VERSION=''
+# If RHEL_VERSION is empty, we infer it from the /etc/os-release file. This is used by OKD as we always want the latest one.
+RUN [ "${RHEL_VERSION}" == "" ] && source /etc/os-release && RHEL_VERSION=${VERSION_ID}; echo ${RHEL_VERSION} > /etc/dnf/vars/releasever \
+    && echo -e "best=True\ninstall_weak_deps=False" >> /etc/dnf/dnf.conf
+RUN dnf -y install jq diffutils
+
+# Pull in the RHCOS extensions repo as a normal, additional dnf repo (not
+# exclusive - the base RHEL repos stay enabled too, for anything the
+# extensions repo doesn't carry). extensions.json (a flat {"pkgname":
+# "version-release.arch"} index) lives one level up from the repo itself.
+COPY --from=extensions /usr/share/rpm-ostree/ /tmp/rhcos-extensions-root/
+RUN printf '[rhcos-extensions]\nname=RHCOS Extensions\nbaseurl=file:///tmp/rhcos-extensions-root/extensions/\nenabled=1\ngpgcheck=0\n' > /etc/yum.repos.d/rhcos-extensions.repo \
+    && dnf -y makecache
+
+# kernel packages needed to build drivers / kmods.
+# Exact NVRs are read out of the extensions image's own extensions.json
+# instead of being supplied as build-args, so the pin can never drift from
+# what RHCOS actually runs. dnf will satisfy these from the rhcos-extensions
+# repo (guaranteed present there); any packages *they* depend on that aren't
+# in the extensions repo (e.g. kernel-modules-core - see header comment) fall
+# back to the normal RHEL repos, same as today.
+RUN set -euxo pipefail; \
+    json=/tmp/rhcos-extensions-root/extensions.json; \
+    evr() { jq -r --arg p "$1" '.[$p]' "$json"; }; \
+    KD=$(evr kernel-devel); \
+    KH=$(evr kernel-headers); \
+    KM=$(evr kernel-modules); \
+    KME=$(evr kernel-modules-extra); \
+    dnf -y install kernel-devel-${KD} kernel-headers-${KH}; \
+    dnf -y install kernel-modules-${KM} kernel-modules-extra-${KME}
+
+# kernel-devel-matched is not currently published as an extension.
+# TODO(openshift/os): add it to the "kernel-devel" extension group.
+# Must be pinned to the exact kernel-devel NVR we just installed - otherwise
+# dnf is free to satisfy it with the latest kernel-devel-matched in the RHEL
+# repos, pulling in a second, unrelated kernel-devel side by side.
+RUN INSTALLED_KERNEL=$(rpm -q --qf "%{VERSION}-%{RELEASE}" kernel-devel) && \
+    dnf -y install kernel-devel-matched-${INSTALLED_KERNEL}
+
+# real-time kernel packages
+# Also, assert that the kernel and kernel-rt rpms come from the same build. Relevant for 9.3+.
+RUN if [ $(arch) = x86_64 ]; then set -euxo pipefail; \
+    json=/tmp/rhcos-extensions-root/extensions.json; \
+    evr() { jq -r --arg p "$1" '.[$p]' "$json"; }; \
+    RTD=$(evr kernel-rt-devel); \
+    RTM=$(evr kernel-rt-modules); \
+    RTME=$(evr kernel-rt-modules-extra); \
+    dnf -y install kernel-rt-devel-${RTD} kernel-rt-modules-${RTM} kernel-rt-modules-extra-${RTME}; \
+    diff --side-by-side <(rpm -qi kernel-core | grep 'Source RPM') <(rpm -qi kernel-rt-core | grep 'Source RPM'); \
+    fi
+
+# 64k-pages kernel packages for aarch64
+# Headers are not compiled, so there is no kernel-64k-headers packages,
+# and compilation will use the headers from kernel-headers
+RUN if [ $(arch) = aarch64 ]; then set -euxo pipefail; \
+    json=/tmp/rhcos-extensions-root/extensions.json; \
+    evr() { jq -r --arg p "$1" '.[$p]' "$json"; }; \
+    K64D=$(evr kernel-64k-devel); \
+    K64M=$(evr kernel-64k-modules); \
+    K64ME=$(evr kernel-64k-modules-extra); \
+    dnf -y install kernel-64k-devel-${K64D} kernel-64k-modules-${K64M} kernel-64k-modules-extra-${K64ME}; \
+    fi
+
+# TODO(openshift/os): kernel-rpm-macros is not published as an extension;
+# falling back to the RHEL repos for now.
+RUN dnf -y install kernel-rpm-macros
+
+# Additional packages that are mandatory for driver-containers
+RUN dnf -y install autoconf automake binutils elfutils-libelf-devel glibc kabi-dw kmod libtool
+
+# Find and install the GCC version used to compile the kernel
+# If it cannot be found (fails on some architectures), install the default gcc
+RUN export INSTALLED_KERNEL=$(rpm -q --qf "%{VERSION}-%{RELEASE}.%{ARCH}"  kernel-devel) && \
+    GCC_VERSION=$(cat /lib/modules/${INSTALLED_KERNEL}/config | grep -Eo "gcc \(GCC\) ([0-9\.]+)" | grep -Eo "([0-9\.]+)") && \
+    dnf -y install gcc-${GCC_VERSION} gcc-c++-${GCC_VERSION} || dnf -y install gcc gcc-c++
+
+# Additional packages that are needed for a subset (e.g DPDK) of driver-containers
+RUN dnf -y install xz diffutils flex bison
+
+# Packages needed to build driver-containers
+RUN dnf -y install git make rpm-build
+
+# Packages needed to sign and run externally build kernel modules
+RUN if [ $(arch) == "x86_64" ] || [ $(arch) == "aarch64" ]; then \
+    ARCH_DEP_PKGS="mokutil"; fi \
+    && dnf -y install openssl keyutils $ARCH_DEP_PKGS
+
+RUN dnf -y remove jq \
+    && dnf clean all && rm -rf /var/cache/dnf/* /etc/yum.repos.d/rhcos-extensions.repo /tmp/rhcos-extensions-root
+
+COPY manifests/01-openshift-imagestream.yaml /manifests/01-openshift-imagestream.yaml
+COPY manifests/image-references /manifests/image-references
+
+ARG TAGS=''
+RUN if echo "${TAGS:-}" | grep -q scos > /dev/null 2>&1; then sed -i 's/rhel-coreos/stream-coreos/g' /manifests/*; fi
+
+LABEL io.k8s.description="driver-toolkit is a container with the kernel packages necessary for building driver containers for deploying kernel modules/drivers on OpenShift" \
+      name="driver-toolkit" \
+      io.openshift.release.operator=true \
+      version="0.1" \
+      io.openshift.os.streamclass=rhel-9
+
+# Last layer for metadata for mapping the driver-toolkit to a specific kernel version
+RUN export INSTALLED_KERNEL=$(rpm -q --qf "%{VERSION}-%{RELEASE}.%{ARCH}"  kernel-devel); \
+    export INSTALLED_RT_KERNEL=$(rpm -q --qf "%{VERSION}-%{RELEASE}.%{ARCH}+rt"  kernel-rt-core); \
+    echo "{ \"KERNEL_VERSION\": \"${INSTALLED_KERNEL}\", \"RT_KERNEL_VERSION\": \"${INSTALLED_RT_KERNEL}\", \"RHEL_VERSION\": \"$(</etc/dnf/vars/releasever)\" }" > /etc/driver-toolkit-release.json

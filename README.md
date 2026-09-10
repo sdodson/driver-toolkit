@@ -52,7 +52,8 @@ $ oc adm release info quay.io/openshift-release-dev/ocp-release:<cluster version
 ```
 
 The script supports two ways of accessing that image's content, and picks whichever is available automatically:
-- **Preferred, no elevated privileges needed:** mount or copy the extensions image's `/usr/share/rpm-ostree` content to `/mnt/rhcos-extensions/usr/share/rpm-ostree` yourself before running the script. If it finds the content already there, it installs directly from it - no podman, no elevated privileges. Two ways to get it there without any privilege:
+- **Preferred, no elevated privileges needed:** mount or copy the extensions image's `/usr/share/rpm-ostree` content to `/mnt/rhcos-extensions/usr/share/rpm-ostree` yourself before running the script. If it finds the content already there, it installs directly from it - no podman, no elevated privileges. A few ways to get it there without any privilege:
+  - Building locally with plain `podman build`, use an ordinary multi-stage `COPY --from=` in your Containerfile - see [Building locally with podman](#building-locally-with-podman) below.
   - In an OpenShift `BuildConfig`, use [`source.images`](https://docs.openshift.com/container-platform/latest/cicd/builds/creating-build-inputs.html#builds-image-source_creating-build-inputs) to copy it into the build context, then `COPY` it into place in your Dockerfile - see the `BuildConfig` example below.
   - In a plain Kubernetes/OpenShift Pod, use an [`image` volume](https://kubernetes.io/docs/concepts/storage/volumes/#image) (requires a cluster new enough to support it):
     ```yaml
@@ -69,6 +70,61 @@ The script supports two ways of accessing that image's content, and picks whiche
 - **Fallback, needs elevated privileges:** pass the extensions image pullspec as the script's argument. It pulls and mounts the image itself using nested podman, which needs to run with enough privilege to create its own container (e.g. `--privileged`). Useful when nothing else has already made the extensions content available, e.g. a plain `podman run <driver-toolkit-image> dtk-install-kernel-packages.sh <extensions-image>`.
 
 If you're already orchestrating with your own podman (>= 5.0) rather than relying on the script's fallback - e.g. to materialize a reusable image once, see [`examples/materialize-driver-toolkit-job.yaml`](./examples/materialize-driver-toolkit-job.yaml) - use podman's own `--mount type=image,source=<extensions-image>,destination=/mnt/rhcos-extensions` when creating the container instead. That hits the script's unprivileged fast path directly: verified locally, `podman create --mount type=image,...`/`start`/`commit`/`push` all work with no elevated privilege, since there's no nested podman pull/mount involved at all.
+
+## Building locally with podman
+This is the most common way to use the Driver Toolkit: build a driver container entirely locally with `podman build`, no OpenShift cluster involved in the build itself (only needed to know which OpenShift version/release you're targeting, and to eventually load the result). It has three parts: find the Driver Toolkit image for your target release, write a Containerfile that uses it to compile the kmod, and copy just the compiled `.ko` files into a clean, minimal final image so the shipped artifact doesn't carry any build tools or kernel packages.
+
+**1. Find the Driver Toolkit image for your target OpenShift version:**
+```bash
+$ oc adm release info quay.io/openshift-release-dev/ocp-release:<x.y.z>-x86_64 --image-for=driver-toolkit
+```
+You'll also need the matching `rhel-coreos-extensions` image (see [Installing kernel packages](#installing-kernel-packages) above) and the kernel version string (`KVER`) - both `--image-for=rhel-coreos-extensions` and the `KERNEL_VERSION` from that image's `extensions.json` (`skopeo inspect --raw <extensions-image> | jq` or just check after the build below - `dtk-install-kernel-packages.sh` prints it).
+
+**2. Write a Containerfile using the Driver Toolkit image as the base for compiling the kmod**, then copy only the compiled `.ko` files into a clean UBI image as the final stage - this drops all the build tools and kernel packages from the shipped artifact:
+```dockerfile
+ARG DTK
+ARG EXTENSIONS_IMAGE
+
+FROM ${EXTENSIONS_IMAGE} AS extensions
+
+FROM ${DTK} AS builder
+ARG KVER
+
+# Kernel packages matching KVER aren't baked into the Driver Toolkit image -
+# install them from the extensions image copied in above via an ordinary
+# multi-stage COPY --from=. See dtk-install-kernel-packages.sh for details;
+# it finds this content unprivileged, no podman needed.
+COPY --from=extensions /usr/share/rpm-ostree/ /mnt/rhcos-extensions/usr/share/rpm-ostree/
+RUN /usr/local/bin/dtk-install-kernel-packages.sh
+
+WORKDIR /build/
+RUN git clone https://github.com/openshift-psap/simple-kmod.git
+WORKDIR /build/simple-kmod
+RUN make all install KVER=${KVER}
+
+FROM registry.redhat.io/ubi9/ubi-minimal
+
+ARG KVER
+
+# Required for installing `modprobe`
+RUN microdnf install kmod
+
+COPY --from=builder /lib/modules/${KVER}/simple-kmod.ko /lib/modules/${KVER}/
+COPY --from=builder /lib/modules/${KVER}/simple-procfs-kmod.ko /lib/modules/${KVER}/
+RUN depmod ${KVER}
+```
+
+**3. Build it**, passing the Driver Toolkit and extensions image pullspecs from step 1 as build-args - podman needs a valid pull secret for both, the same one used to install the cluster:
+```bash
+$ podman build \
+    --authfile=path/to/pullsecret.json \
+    --build-arg DTK=<driver-toolkit image from step 1> \
+    --build-arg EXTENSIONS_IMAGE=<rhel-coreos-extensions image from step 1> \
+    --build-arg KVER=<kernel version> \
+    -t simple-kmod-driver-container:demo \
+    -f Containerfile .
+```
+The resulting `simple-kmod-driver-container:demo` image contains only the compiled `.ko` files and `modprobe`/`kmod` - no compiler, no kernel-devel, no other build tooling. Push it wherever your cluster can pull it from, then deploy it the same way as in [Example usage](#example-usage) below (the `ServiceAccount`/`Role`/`RoleBinding`/`DaemonSet` steps apply the same regardless of how the image was built).
 
 ## Example usage
 The Driver Toolkit can be used as the base image for building a very simple kernel module called simple-kmod. For these steps, you will need to be logged into an OpenShift cluster as a user with cluster-admin privileges, and access to the `oc` CLI.

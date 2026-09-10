@@ -52,22 +52,21 @@ $ oc adm release info quay.io/openshift-release-dev/ocp-release:<cluster version
 ```
 
 The script supports two ways of accessing that image's content, and picks whichever is available automatically:
-- **Preferred, no elevated privileges needed:** mount the extensions image yourself at `/mnt/rhcos-extensions` before running the script - for example with a Kubernetes/OpenShift [`image` volume](https://kubernetes.io/docs/concepts/storage/volumes/#image) (requires a cluster new enough to support it):
-  ```yaml
-  volumes:
-  - name: rhcos-extensions
-    image:
-      reference: <rhel-coreos-extensions-pullspec>
-      pullPolicy: IfNotPresent
-  containers:
-  - volumeMounts:
+- **Preferred, no elevated privileges needed:** mount or copy the extensions image's `/usr/share/rpm-ostree` content to `/mnt/rhcos-extensions/usr/share/rpm-ostree` yourself before running the script. If it finds the content already there, it installs directly from it - no podman, no elevated privileges. Two ways to get it there without any privilege:
+  - In an OpenShift `BuildConfig`, use [`source.images`](https://docs.openshift.com/container-platform/latest/cicd/builds/creating-build-inputs.html#builds-image-source_creating-build-inputs) to copy it into the build context, then `COPY` it into place in your Dockerfile - see the `BuildConfig` example below.
+  - In a plain Kubernetes/OpenShift Pod, use an [`image` volume](https://kubernetes.io/docs/concepts/storage/volumes/#image) (requires a cluster new enough to support it):
+    ```yaml
+    volumes:
     - name: rhcos-extensions
-      mountPath: /mnt/rhcos-extensions
-  ```
-  If the script finds the extensions content already there, it installs directly from it - no podman, no elevated privileges.
-- **Fallback, needs elevated privileges:** pass the extensions image pullspec as the script's argument. It pulls and mounts the image itself using nested podman, which needs to run with enough privilege to create its own container (e.g. `--privileged`).
-
-Because the kernel-package install itself can (in the preferred case) run unprivileged, but *producing a new, reusable image* out of a running container still needs a privileged commit step, this repo's example usage below uses a two-phase approach: a one-time, privileged Job "materializes" a Driver Toolkit image with kernel packages baked in for a specific release, and that materialized image is then used as an ordinary (unprivileged) build base for as many kmod builds as you need against that kernel version. See [`examples/materialize-driver-toolkit-job.yaml`](./examples/materialize-driver-toolkit-job.yaml).
+      image:
+        reference: <rhel-coreos-extensions-pullspec>
+        pullPolicy: IfNotPresent
+    containers:
+    - volumeMounts:
+      - name: rhcos-extensions
+        mountPath: /mnt/rhcos-extensions
+    ```
+- **Fallback, needs elevated privileges:** pass the extensions image pullspec as the script's argument. It pulls and mounts the image itself using nested podman, which needs to run with enough privilege to create its own container (e.g. `--privileged`). Useful outside of OpenShift builds/Pods, e.g. a plain `podman run`, or for one-time materialization of a reusable image - see [`examples/materialize-driver-toolkit-job.yaml`](./examples/materialize-driver-toolkit-job.yaml) for that pattern.
 
 ## Example usage
 The Driver Toolkit can be used as the base image for building a very simple kernel module called simple-kmod. For these steps, you will need to be logged into an OpenShift cluster as a user with cluster-admin privileges, and access to the `oc` CLI.
@@ -77,14 +76,7 @@ Create a namespace for the resources:
 $ oc new-project simple-kmod-demo
 ```
 
-Before building the kmod, materialize a Driver Toolkit image with the kernel packages for your target release already installed - see [Installing kernel packages](#installing-kernel-packages) above. Fill in `DTK_IMAGE`/`EXTENSIONS_IMAGE` in [`examples/materialize-driver-toolkit-job.yaml`](./examples/materialize-driver-toolkit-job.yaml) with the values from `oc adm release info --image-for=driver-toolkit`/`--image-for=rhel-coreos-extensions`, create the `driver-toolkit-materializer-auth` secret it needs, grant its ServiceAccount the `privileged` SCC, then:
-```bash
-$ oc apply -f examples/materialize-driver-toolkit-job.yaml
-$ oc wait --for=condition=complete job/driver-toolkit-materialize --timeout=15m
-```
-This only needs to run once per RHCOS kernel version - the resulting `driver-toolkit-materialized:latest` image can be reused as the build base for as many kmod builds as you need against that kernel, with no elevated privileges required for those builds.
-
-The following YAML defines an `ImageStream` for storing the simple-kmod driver container image, and a `BuildConfig` for building the container. You can apply the following yaml:
+The following YAML defines an `ImageStream` for storing the simple-kmod driver container image, and a `BuildConfig` for building the container. The `BuildConfig` uses `source.images` to copy the kernel packages for your target release out of the `rhel-coreos-extensions` image, unprivileged, into the build context (see [Installing kernel packages](#installing-kernel-packages) above) - the embedded Dockerfile then `COPY`s that content into place and runs `dtk-install-kernel-packages.sh` before compiling. You can apply the following yaml:
 ```yaml
 apiVersion: image.openshift.io/v1
 kind: ImageStream
@@ -110,11 +102,26 @@ spec:
     - type: "ConfigChange"
     - type: "ImageChange"
   source:
+    images:
+      # $ oc adm release info quay.io/openshift-release-dev/ocp-release:<cluster version>-x86_64 --image-for=rhel-coreos-extensions
+      - from:
+          kind: DockerImage
+          name: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:43d85fd7035142e221277bbf6f127c16df088bfe7edffd6d11c9aea0f9a93ab6
+        paths:
+          - sourcePath: /usr/share/rpm-ostree/.
+            destinationDir: rhcos-extensions
     dockerfile: |
       ARG DTK
       FROM ${DTK} as builder
 
       ARG KVER
+
+      # Kernel packages matching KVER aren't baked into the Driver Toolkit
+      # image - install them from the rhcos-extensions content copied in by
+      # this BuildConfig's source.images, above. See dtk-install-kernel-packages.sh
+      # for details; it finds this content unprivileged, no podman needed.
+      COPY rhcos-extensions/ /mnt/rhcos-extensions/usr/share/rpm-ostree/
+      RUN /usr/local/bin/dtk-install-kernel-packages.sh
 
       WORKDIR /build/
 
@@ -139,11 +146,9 @@ spec:
       buildArgs:
         - name: KMODVER
           value: DEMO
-          # The materialized image from the Job above, not the raw payload
-          # driver-toolkit image - it already has the matching kernel
-          # packages installed, so this BuildConfig runs unprivileged.
+          # $ oc adm release info quay.io/openshift-release-dev/ocp-release:<cluster version>-x86_64 --image-for=driver-toolkit
         - name: DTK
-          value: image-registry.openshift-image-registry.svc:5000/simple-kmod-demo/driver-toolkit-materialized:latest
+          value: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:34864ccd2f4b6e385705a730864c04a40908e57acede44457a783d739e377cae
         - name: KVER
           value: 4.18.0-372.26.1.el8_6.x86_64
   output:
@@ -152,7 +157,7 @@ spec:
       name: simple-kmod-driver-container:demo
 ```
 
-You can replace the `buildArgs` in order to cusomize it as you need.
+You can replace the `buildArgs` and `source.images` values in order to customize it as you need - `KVER` and the `rhel-coreos-extensions` image should come from the same release as `DTK`.
 
 Once the builder pod completes successfully, deploy the driver container image as a DaemonSet. The driver container needs to run with the privileged security context in order to load the kernel modules on the host. The following .yaml file contains the RBAC rules and the DaemonSet for running the driver container. Apply the following yaml:
 

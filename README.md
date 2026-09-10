@@ -66,7 +66,9 @@ The script supports two ways of accessing that image's content, and picks whiche
       - name: rhcos-extensions
         mountPath: /mnt/rhcos-extensions
     ```
-- **Fallback, needs elevated privileges:** pass the extensions image pullspec as the script's argument. It pulls and mounts the image itself using nested podman, which needs to run with enough privilege to create its own container (e.g. `--privileged`). Useful outside of OpenShift builds/Pods, e.g. a plain `podman run`, or for one-time materialization of a reusable image - see [`examples/materialize-driver-toolkit-job.yaml`](./examples/materialize-driver-toolkit-job.yaml) for that pattern.
+- **Fallback, needs elevated privileges:** pass the extensions image pullspec as the script's argument. It pulls and mounts the image itself using nested podman, which needs to run with enough privilege to create its own container (e.g. `--privileged`). Useful when nothing else has already made the extensions content available, e.g. a plain `podman run <driver-toolkit-image> dtk-install-kernel-packages.sh <extensions-image>`.
+
+If you're already orchestrating with your own podman (>= 5.0) rather than relying on the script's fallback - e.g. to materialize a reusable image once, see [`examples/materialize-driver-toolkit-job.yaml`](./examples/materialize-driver-toolkit-job.yaml) - use podman's own `--mount type=image,source=<extensions-image>,destination=/mnt/rhcos-extensions` when creating the container instead. That hits the script's unprivileged fast path directly: verified locally, `podman create --mount type=image,...`/`start`/`commit`/`push` all work with no elevated privilege, since there's no nested podman pull/mount involved at all.
 
 ## Example usage
 The Driver Toolkit can be used as the base image for building a very simple kernel module called simple-kmod. For these steps, you will need to be logged into an OpenShift cluster as a user with cluster-admin privileges, and access to the `oc` CLI.

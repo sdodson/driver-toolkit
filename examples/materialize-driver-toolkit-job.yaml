@@ -3,33 +3,32 @@
 # it can be used as an ordinary (unprivileged) build base afterwards. See
 # ../README.md for the full walkthrough.
 #
-# This uses a Kubernetes `image` volume (kubelet/CRI-O pulls and mounts
-# EXTENSIONS_IMAGE for us, no elevated privilege needed for that part) so
+# This uses podman's own `--mount type=image` (podman >= 5.0) to mount
+# EXTENSIONS_IMAGE directly when creating the nested container, so
 # dtk-install-kernel-packages.sh hits its fast path and never has to pull or
-# mount the extensions image itself - see the volume/volumeMount below and
-# the script's own comments. Requires a cluster with the `image` volume
-# source available (Kubernetes 1.31+, feature-gated).
+# mount the extensions image itself. Verified locally: `podman create --mount
+# type=image,...` + `start` + `commit` + `push` all work with no elevated
+# privilege at all - no --privileged, no SCC changes, no storage-driver
+# workarounds - because there's only one level of container nesting here
+# (this Job's own container, already running the Driver Toolkit image with
+# podman bundled in, creates and commits exactly one nested container).
 #
-# The container as a whole still needs to run privileged: packaging the
-# installed result into a new, pushable image is done with one level of
-# nested podman (`podman create`/`commit`/`push`), which needs enough
-# privilege to create its own container. If your cluster doesn't support
-# `image` volumes yet, drop the volume/volumeMount below and instead pass
-# EXTENSIONS_IMAGE as the nested container's command argument -
-# dtk-install-kernel-packages.sh falls back to pulling/mounting it itself.
+# securityContext.privileged is *not* set below on that basis. Some clusters
+# may still restrict nested podman for other reasons (e.g. no /dev/fuse, no
+# rootless-overlay kernel support, or a restrictive SCC) - if `podman create`
+# fails in this Job, that's the first thing to check; add
+# `securityContext.privileged: true` back as a fallback in that case.
 #
 # Before applying:
 #   1. Replace DTK_IMAGE / EXTENSIONS_IMAGE / OUTPUT_IMAGE below with your
 #      values (see README.md for how to find the first two via
 #      `oc adm release info --image-for=...`).
 #   2. Create the driver-toolkit-materializer-auth secret referenced below,
-#      containing a .dockerconfigjson with pull access to DTK_IMAGE and push
-#      access to OUTPUT_IMAGE. If OUTPUT_IMAGE is an ImageStreamTag in this
-#      namespace, you can reuse this namespace's auto-created
-#      `builder-dockercfg-*` secret merged with your OpenShift pull secret.
-#   3. Grant the driver-toolkit-materializer ServiceAccount the `privileged`
-#      SCC (needed for the nested podman commit/push step):
-#        oc adm policy add-scc-to-user privileged -z driver-toolkit-materializer
+#      containing a .dockerconfigjson with pull access to DTK_IMAGE /
+#      EXTENSIONS_IMAGE and push access to OUTPUT_IMAGE. If OUTPUT_IMAGE is
+#      an ImageStreamTag in this namespace, you can reuse this namespace's
+#      auto-created `builder-dockercfg-*` secret merged with your OpenShift
+#      pull secret.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -50,11 +49,11 @@ spec:
           # Same image this Job will install kernel packages into - it
           # already bundles podman and dtk-install-kernel-packages.sh.
           image: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:REPLACE_WITH_DTK_IMAGE_DIGEST
-          securityContext:
-            privileged: true
           env:
             - name: DTK_IMAGE
               value: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:REPLACE_WITH_DTK_IMAGE_DIGEST
+            - name: EXTENSIONS_IMAGE
+              value: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:REPLACE_WITH_EXTENSIONS_IMAGE_DIGEST
             - name: OUTPUT_IMAGE
               value: image-registry.openshift-image-registry.svc:5000/simple-kmod-demo/driver-toolkit-materialized:latest
             - name: REGISTRY_AUTH_FILE
@@ -63,26 +62,19 @@ spec:
             - /bin/bash
             - -ceu
             - |
-              podman --storage-driver vfs pull "${DTK_IMAGE}"
-              cid=$(podman --storage-driver vfs create \
-                  -v /mnt/rhcos-extensions:/mnt/rhcos-extensions:ro \
+              podman pull "${DTK_IMAGE}"
+              cid=$(podman create \
+                  --mount type=image,source="${EXTENSIONS_IMAGE}",destination=/mnt/rhcos-extensions,readwrite=false \
                   "${DTK_IMAGE}" dtk-install-kernel-packages.sh)
-              podman --storage-driver vfs start --attach "${cid}"
-              podman --storage-driver vfs commit "${cid}" "${OUTPUT_IMAGE}"
-              podman --storage-driver vfs push "${OUTPUT_IMAGE}"
-              podman --storage-driver vfs rm "${cid}"
+              podman start --attach "${cid}"
+              podman commit "${cid}" "${OUTPUT_IMAGE}"
+              podman push "${OUTPUT_IMAGE}"
+              podman rm "${cid}"
           volumeMounts:
             - name: materializer-auth
               mountPath: /var/run/secrets/materializer-auth
-              readOnly: true
-            - name: rhcos-extensions
-              mountPath: /mnt/rhcos-extensions
               readOnly: true
       volumes:
         - name: materializer-auth
           secret:
             secretName: driver-toolkit-materializer-auth
-        - name: rhcos-extensions
-          image:
-            reference: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:REPLACE_WITH_EXTENSIONS_IMAGE_DIGEST
-            pullPolicy: IfNotPresent

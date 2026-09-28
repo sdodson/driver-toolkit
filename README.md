@@ -74,11 +74,12 @@ If you're already orchestrating with your own podman (>= 5.0) rather than relyin
 ## Building locally with podman
 This is the most common way to use the Driver Toolkit: build a driver container entirely locally with `podman build`, no OpenShift cluster involved in the build itself (only needed to know which OpenShift version/release you're targeting, and to eventually load the result). It has three parts: find the Driver Toolkit image for your target release, write a Containerfile that uses it to compile the kmod, and copy just the compiled `.ko` files into a clean, minimal final image so the shipped artifact doesn't carry any build tools or kernel packages.
 
-**1. Find the Driver Toolkit image for your target OpenShift version:**
+**1. Find the Driver Toolkit and matching `rhel-coreos-extensions` images for your target OpenShift version** (see [Installing kernel packages](#installing-kernel-packages) above for why the extensions image is needed):
 ```bash
-$ oc adm release info quay.io/openshift-release-dev/ocp-release:<x.y.z>-x86_64 --image-for=driver-toolkit
+$ export DTK=$(oc adm release info quay.io/openshift-release-dev/ocp-release:<x.y.z>-x86_64 --image-for=driver-toolkit)
+$ export EXTENSIONS_IMAGE=$(oc adm release info quay.io/openshift-release-dev/ocp-release:<x.y.z>-x86_64 --image-for=rhel-coreos-extensions)
 ```
-You'll also need the matching `rhel-coreos-extensions` image (see [Installing kernel packages](#installing-kernel-packages) above) and the kernel version string (`KVER`) - both `--image-for=rhel-coreos-extensions` and the `KERNEL_VERSION` from that image's `extensions.json` (`skopeo inspect --raw <extensions-image> | jq` or just check after the build below - `dtk-install-kernel-packages.sh` prints it).
+You'll also need the kernel version string (`KVER`) - the `KERNEL_VERSION` from the extensions image's `extensions.json` (`skopeo inspect --raw ${EXTENSIONS_IMAGE} | jq` or just check after the build below - `dtk-install-kernel-packages.sh` prints it).
 
 **2. Write a Containerfile using the Driver Toolkit image as the base for compiling the kmod**, then copy only the compiled `.ko` files into a clean UBI image as the final stage - this drops all the build tools and kernel packages from the shipped artifact:
 ```dockerfile
@@ -118,8 +119,8 @@ RUN depmod ${KVER}
 ```bash
 $ podman build \
     --authfile=path/to/pullsecret.json \
-    --build-arg DTK=<driver-toolkit image from step 1> \
-    --build-arg EXTENSIONS_IMAGE=<rhel-coreos-extensions image from step 1> \
+    --build-arg DTK=${DTK} \
+    --build-arg EXTENSIONS_IMAGE=${EXTENSIONS_IMAGE} \
     --build-arg KVER=<kernel version> \
     -t simple-kmod-driver-container:demo \
     -f Containerfile .

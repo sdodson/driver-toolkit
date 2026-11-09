@@ -43,6 +43,13 @@ This image can be pulled using a valid pull secret.
 $ podman pull --authfile=path/to/pullsecret.json <image from previous output>
 ```
 
+### Finding the Driver Toolkit image from inside the cluster
+If you're building from within the OpenShift cluster you're targeting, rather than against a release pullspec, every cluster publishes its own `driver-toolkit` `ImageStream` in the `openshift` namespace, with a tag for each RHCOS version currently running in the cluster - no release pullspec or `oc adm release info` lookup needed. See [docs/driver_toolkit_imagestream.md](./docs/driver_toolkit_imagestream.md) for how that `ImageStream` gets populated.
+```bash
+$ oc get imagestreamtag -n openshift driver-toolkit:latest
+```
+This tracks the cluster's current RHCOS version automatically (including across upgrades), rather than a specific OpenShift release you choose - use the `oc adm release info`/catalog methods above instead if you need to target a release other than the one the cluster is currently running.
+
 ## Installing kernel packages
 The Driver Toolkit image does not contain `kernel-devel`/`kernel-headers`/`kernel-modules`/etc. - those packages have to exactly match the RHCOS kernel version of the cluster you're targeting, which isn't known until you decide which cluster/release you're building for. Instead, they're installed at the point of use by [`scripts/dtk-install-kernel-packages.sh`](./scripts/dtk-install-kernel-packages.sh), which is already present in the image at `/usr/local/bin/dtk-install-kernel-packages.sh`.
 
@@ -206,6 +213,8 @@ spec:
         - name: KMODVER
           value: DEMO
           # $ oc adm release info quay.io/openshift-release-dev/ocp-release:<cluster version>-x86_64 --image-for=driver-toolkit
+          # or, from inside the cluster you're targeting (see "Finding the Driver Toolkit image from inside the cluster" above):
+          # $ oc get imagestreamtag -n openshift driver-toolkit:latest -o jsonpath='{.image.dockerImageReference}'
         - name: DTK
           value: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:34864ccd2f4b6e385705a730864c04a40908e57acede44457a783d739e377cae
         - name: KVER
